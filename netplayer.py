@@ -10,6 +10,7 @@ import pyaudio
 import sys
 import threading
 import wave
+import queue
 
 
 class AsyncNetBase:
@@ -78,27 +79,24 @@ class AsyncNetBase:
             proc.join()
 
 
-class defaultdeque:
-    def __new__(self):
-        return collections.deque(maxlen=1024)
-
-
 class AsyncUdp(AsyncNetBase):
     def __init__(self, server=False, *args, **kwargs):
         super().__init__(udp=True, server=server, *args, **kwargs)
-        self.clients = collections.defaultdict(defaultdeque)
-        self.sendBuffer = defaultdeque()
-        self.active = None
+        self.sendBuffer = collections.deque()
+        self.receiveBuffer = collections.deque()
+        self.clients, self.active = {}, None
+        self.buffered = False
 
-    def process(self, client, data, purge=True):
+    def process(self, client, data):
         if self.active != client:
             self.active = client
             if client not in self.clients.keys():
                 print(f'Receiving from {client}')
-        if purge:
-            for other in filter(lambda seen: seen != client, self.clients.keys()):
-                self.clients[other] = self.clients.default_factory()
-        self.clients[client].append(data)
+                self.receiveBuffer = collections.deque()
+                self.buffered = False
+        self.receiveBuffer.append(data)
+        if len(self.receiveBuffer) >= self.bufferSize:
+            self.buffered = True
 
     async def receive(self):
         print('Starting receiver')
@@ -135,7 +133,7 @@ class AsyncUdp(AsyncNetBase):
         async for client in self.clients.keys():
             await self.send(data, client, port)
 
-    def buffer(self, data, client):
+    async def buffer(self, data, client):
         self.sendBuffer.append((data, client))
 
 
@@ -158,18 +156,30 @@ class NetPlayer(AsyncUdp):
         self.stream.close()
         self.player.terminate()
 
-    async def listen(self):
-        data = None
-        await curio.spawn(super().receive)
+    async def play_buffer(self):
         while self.alive:
-            data = self.clients[self.active]
-            if data:
-                self.stream.write(data.popleft())
+            await curio.sleep(0)
+            if not self.buffered:
+                continue
+            if self.receiveBuffer:
+                chunk = self.receiveBuffer.popleft()
+                self.stream.write(chunk)
+
+    async def listen(self):
+        await curio.spawn(super().receive)
+        await curio.spawn(self.play_buffer)
+        while self.alive:
             await curio.sleep(0)
         await self.close()
 
     def start(self):
         curio.run(self.listen)
+
+    def run(self):
+        try:
+            self.start()
+        except KeyboardInterrupt:
+            self.alive = False
 
 
 class NetSender(AsyncUdp):
@@ -180,6 +190,7 @@ class NetSender(AsyncUdp):
         self.target = target
         self.files = []
         self.loop = loop
+        self.chunkSize = 1024
 
     @property
     def target(self):
@@ -197,26 +208,42 @@ class NetSender(AsyncUdp):
         self._target = val
 
     def add_files(self, *files):
-        for file in files:
-            if os.path.exists(file):
-                self.files.append(file)
+        for filepath in files:
+            assert isinstance(filepath, str), 'Must be str'
+            assert os.path.exists(filepath), 'File not found'
+            self.files.append(filepath)
+
+    def scan(self, filepath, recursive=True):
+        try:
+            for f in os.scandir(filepath):
+                if not f.is_dir():
+                    self.add_files(f.path)
+                elif recursive:
+                    self.add_files(f.path)
+        except NotADirectoryError:
+            self.add_files(filepath)
+        self.files.sort()
 
     def open(self, filename):
         print(f'Opening {filename}')
         with wave.open(filename, 'rb') as wav:
-            chunk = wav.readframes(1024)
+            chunk = wav.readframes(self.chunkSize)
             while chunk:
-                yield np.frombuffer(chunk, dtype=np.int16)
-                chunk = wav.readframes(1024)
+                # yield np.frombuffer(chunk, dtype=np.int16)
+                yield chunk
+                chunk = wav.readframes(self.chunkSize)
         print(f'{filename} buffered')
 
     async def buffer_file(self, filename):
-        for chunk in self.open(filename):
-            super().buffer(chunk, self.target)
-            await curio.sleep(0)
+        try:
+            for chunk in self.open(filename):
+                await (await curio.spawn(super().send(chunk, self.target))).join()
+                # await super().buffer(chunk, self.target)
+        except wave.Error:
+            return
 
     async def run(self):
-        await super().add_tasks(super().send_from_buffer)
+        # await super().add_tasks(super().send_from_buffer)
         for filename in (itertools.cycle(self.files) if self.loop else self.files):
             await self.buffer_file(filename)
         await super().close()
@@ -236,8 +263,8 @@ if __name__ == '__main__':
         command = 'receive'
     if command.lower() in ['send', 'snd', 's']:
         with NetSender() as ns:
-            ns.add_files('./audio_files/pinkNoise_01.wav')
+            ns.scan('./audio_files')
             ns.play()
     elif command.lower() in ['recv', 'rec', 'receive', 'r']:
         with NetPlayer() as server:
-            server.start()
+            server.run()
