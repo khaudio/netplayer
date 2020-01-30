@@ -1,8 +1,5 @@
 #!/usr/bin/env python
 
-# TODO:
-#     client dataclass with meta
-#     sender subclass + playing
 
 import collections
 import curio
@@ -16,10 +13,12 @@ import sys
 import threading
 import wave
 import queue
+import time
+import json
 
 
 class AsyncNetBase:
-    def __init__(self, host='', port=52345, udp=False, server=False, bufferSize=4096):
+    def __init__(self, host='', port=52345, udp=False, server=False, bufferSize=8192):
         self.alive = True
         self.bufferSize = bufferSize
         self.procs, self.tasks = set(), curio.TaskGroup(wait=any)
@@ -85,22 +84,21 @@ class AsyncNetBase:
             proc.join()
 
 
-class DefaultClient(collections.defaultdict):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.update({'time': None, 'latency': 0})
+@dataclass
+class Client:
+    ip: str
+    latency: float = 0.0
 
+    def update_latency(self, clientTime):
+        self.latency = time.time() - clientTime
 
 
 class AsyncUdp(AsyncNetBase):
     def __init__(self, server=False, monitor=True, monitorPort='', *args, **kwargs):
         super().__init__(udp=True, server=server, *args, **kwargs)
-        self.sendBuffer = collections.deque()
-        self.receiveBuffer = collections.deque()
-        self.clients = collections.defaultdict(DefaultClient)
-        self.active = None
-        self.latency = None
-        self.buffered = False
+        self.clients = {}
+        self.sendBuffer, self.receiveBuffer = collections.deque(), collections.deque()
+        self.active, self.latency, self.buffered = None, None, False
         self.monitorPort = (self.port + 1) if not monitorPort else monitorPort
         if monitor:
             self._udp.bind(('', self.monitorPort))
@@ -108,7 +106,7 @@ class AsyncUdp(AsyncNetBase):
     @property
     def latency(self):
         return self._latencyOverride if self._latencyOverride is not None else 0
-    
+
     @latency.setter
     def latency(self, val):
         if val is not None:
@@ -118,10 +116,10 @@ class AsyncUdp(AsyncNetBase):
     def update_client(self, client, meta=None):
         if client not in self.clients.keys():
             print(f'Found {client}')
-            self.clients[client]
+            self.clients[client] = Client(client)
         if meta:
-            self.clients[client].update(meta)
-        self.latency = max(val['latency'] for val in self.clients.values())
+            self.clients[client].update_latency(meta['time'])
+        self.latency = max(client.latency for client in self.clients.values())
 
     def process(self, client, data):
         self.update_client(client)
@@ -175,7 +173,7 @@ class AsyncUdp(AsyncNetBase):
     async def broadcast(self, data, client='255.255.255.255', port=None):
         port = self.monitorPort if not port else port
         await self.send(data, client, port)
-    
+
     async def monitor(self):
         while self.alive:
             client, data = await self.receive(buffer=False, sock=self._udp)
@@ -191,6 +189,10 @@ class AsyncUdp(AsyncNetBase):
 
     async def buffer(self, data, client):
         self.sendBuffer.append((data, client))
+
+    async def flush(self):
+        while len(self.sendBuffer):
+            curio.sleep(0)
 
 
 class NetPlayer(AsyncUdp):
@@ -242,8 +244,11 @@ class NetSender(AsyncUdp):
     """Send audio over a network"""
 
     def __init__(self, target='127.0.0.1', loop=False, *args, **kwargs):
-        monitor = (target not in ('127.0.0.1', '127.0.1.1', 'localhost'))
-        super().__init__(server=False, monitor=monitor, *args, **kwargs)
+        super().__init__(
+                server=False,
+                monitor=(target not in ('127.0.0.1', '127.0.1.1', 'localhost')),
+                *args, **kwargs
+            )
         self.target = target
         self.files = []
         self.loop = loop
@@ -295,45 +300,39 @@ class NetSender(AsyncUdp):
         try:
             for chunk in self.open(filename):
                 await (await self.tasks.spawn(super().send(chunk, self.target))).join()
-                # await super().buffer(chunk, self.target)
         except wave.Error:
             return
 
     async def run(self):
-        # await super().add_tasks(super().send_from_buffer)
         for filename in (itertools.cycle(self.files) if self.loop else self.files):
             await self.buffer_file(filename)
         await super().close()
 
-    def play_single(self, filename):
-        self.add_files(filename)
-        self.play()
-
     def play(self):
         curio.run(self.run)
 
+    def play_files(self, *files):
+        self.add_files(*files)
+        self.play()
 
-@dataclass
-class Client:
-    latency: int = 0
 
-
-def main():
+if __name__ == '__main__':
     try:
         command = sys.argv[1]
     except IndexError:
         command = 'receive'
     try:
+        target = sys.argv[2].strip()
+    except IndexError:
+        target = '127.0.0.1'
+    try:
         assets = sys.argv[3]
     except IndexError:
-        assets = './audio_files'
+        assets = '../audio_files'
     if command.lower() in ['send', 'snd', 's']:
-        with NetSender() as ns:
+        with NetSender(target) as ns:
             ns.scan(assets)
             ns.play()
     elif command.lower() in ['recv', 'rec', 'receive', 'r']:
         with NetPlayer() as server:
             server.run()
-
-if __name__ == '__main__':
-    main()
