@@ -350,7 +350,7 @@ class AudioReceiver(NetplayerBase):
         if not self._requested:
             await sock.sendall(self._encode_request())
             self._requested = True
-
+    
     def _get_header(self, data):
         try:
             header = json.loads(data)
@@ -358,7 +358,9 @@ class AudioReceiver(NetplayerBase):
             self.framecount = int(header['framecount'])
             self.filesize = int(header['filesize'])
             self.remaining = self.filesize
-            self.set_format(*header['format'][0:3])
+            print(f'Header format received: {header["format"]}')
+            nchannels, sampwidth, samprate = header['format'][0:3]
+            self.set_format(nchannels, sampwidth * 8, samprate)
         except:
             return
         else:
@@ -433,6 +435,8 @@ class AudioReceiver(NetplayerBase):
             callbackIsCoroutine = inspect.iscoroutine(callback(b''))
         except RuntimeWarning:
             pass
+        except:
+            pass
         if callback and not callable(callback):
             raise ValueError('Callback must be callable')
         while self.alive:
@@ -469,13 +473,12 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
 
     def set_format(self, *args, **kwargs):
         print('Setting NetPlayerReceiver format')
-        print(*args, **kwargs)
         super().set_format(*args, **kwargs)
-        print('Setting NetPlayerReceiver buffers')
-        super().set_buffers(**kwargs)
-
+    
     def _get_header(self, *args, **kwargs):
         super()._get_header(*args, **kwargs)
+        print('Setting NetPlayerReceiver buffers')
+        super().set_buffers(**kwargs)
         print('Got header; starting output buffer')
         super().start()
 
@@ -488,7 +491,7 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
         if data is None:
             return
         super().write(data)
-
+    
         print(data)
         time.sleep(1)
 

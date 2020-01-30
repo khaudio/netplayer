@@ -351,9 +351,15 @@ class PlayableAudioDevice:
         self.__streamOpen = False
         self.__formatSet = False
         self.frameRate = None
+        self.bufferLength = None
+        self.ringSize = None
+        self.__format = None
+        self.channels = None
+        self.frameRate = None
+        self.sampleRate = None
         if any(kwargs):
             self.set_format(**kwargs)
-            self.set_buffer(**kwargs)
+            self.set_buffers(**kwargs)
 
     def __del__(self):
         self.close()
@@ -364,15 +370,34 @@ class PlayableAudioDevice:
     def __exit__(self, exc_type, exc_value, exc_traceback):
         self.close()
 
+    @property
+    def format(self):
+        return self.__format
+
+    @format.setter
+    def format(self, audioFormat):
+        if isinstance(audioFormat, int):
+            audioFormat = self._formatDefaultInferences.get(audioFormat)
+        if audioFormat not in self._formatZeroValues.keys():
+            raise ValueError('Invalid format')
+        else:
+            self.__format = audioFormat
+        self.__zero = self._formatZeroValues[self.__format]
+
     def set_format(
-                self, channels=2, format=pyaudio.paInt16,
+                self, channels=2, audioFormat=pyaudio.paInt16,
                 frameRate=88200, **kwargs
             ):
         print('Setting format')
-        self.format = format
+        print(
+                'Format args: ', channels, audioFormat,
+                frameRate, **kwargs
+              )
+        self.format = audioFormat
         self.channels = channels
         self.frameRate = frameRate
         self.sampleRate = self.frameRate / self.channels
+        print('Format set')
     
     def set_buffers(self, bufferLength=None, ringSize=None, **kwargs):
         print('Setting buffers')
@@ -417,21 +442,7 @@ class PlayableAudioDevice:
             )
         self.__streamOpen = True
         self.__formatSet = True
-        print('Format set')
-
-    @property
-    def format(self):
-        return self.__format
-    
-    @format.setter
-    def format(self, audioFormat):
-        if isinstance(audioFormat, int):
-            audioFormat = self._formatDefaultInferences.get(audioFormat)
-        if audioFormat not in self._formatZeroValues.keys():
-            raise ValueError('Invalid format')
-        else:
-            self.__format = audioFormat
-        self.__zero = self._formatZeroValues[self.__format]
+        print('Buffers set')
 
     def start(self):
         self.interleaved.start_rotate_thread()
