@@ -138,9 +138,9 @@ class RingBuffer(RingBufferBase):
         self.samplesRemaining = self.bufferLength
         self.totalRingSampleLength = self.bufferLength * self.ringSize
         self._readIndex, self._writeIndex = 0, 1
-        for buffer in self.ring:
+        for buff in self.ring:
             for _ in range(self.bufferLength):
-                buffer.append(0)
+                buff.append(0)
         self.callback = None
     
     def _pad(self, filler=0, bufferIndex=None, sampleIndex=None):
@@ -156,9 +156,9 @@ class RingBuffer(RingBufferBase):
     
     def fill(self, filler=0, force=False):
         if force:
-            for buffer in self.ring:
+            for buff in self.ring:
                 for i in range(self.bufferLength):
-                    buffer[i] = filler
+                    buff[i] = filler
         else:
             while self.writable():
                 self._fill_single(filler)
@@ -243,7 +243,7 @@ class RingBuffer(RingBufferBase):
                 return data[written:]
 
 class ThreadedRingBuffer(RingBuffer):
-    def __init__(self, bufferLength=64, ringSize=8, sampleRate=48000, zero=0.0):
+    def __init__(self, bufferLength=64, ringSize=8, sampleRate=44100, zero=0.0):
         super().__init__(bufferLength, ringSize)
         self.sampleRate = sampleRate
         self.__pauseLock = Lock()
@@ -335,6 +335,14 @@ class PlayableAudioDevice:
             24: pyaudio.paInt24,
             32: pyaudio.paFloat32
         }
+    _formatBitDepths = {
+            pyaudio.paFloat32: 32,
+            pyaudio.paInt32: 32,
+            pyaudio.paInt24: 24,
+            pyaudio.paInt16: 16,
+            pyaudio.paInt8: 8,
+            pyaudio.paUInt8: 8,
+        }
     _formatZeroValues = {
             pyaudio.paFloat32: 0.0,
             pyaudio.paInt32: 0,
@@ -349,14 +357,14 @@ class PlayableAudioDevice:
         self._player = pyaudio.PyAudio()
         self.stream = None
         self.__streamOpen = False
-        self.__formatSet = False
-        self.frameRate = None
+        self.channels = None
+        self.__sampWidth = None
+        self.__bitDepth = None
+        self.__frameRate = None
+        self.__format = None
         self.bufferLength = None
         self.ringSize = None
-        self.__format = None
-        self.channels = None
-        self.frameRate = None
-        self.sampleRate = None
+        self.__formatSet = False
         if any(kwargs):
             self.set_format(**kwargs)
             self.set_buffers(**kwargs)
@@ -371,50 +379,71 @@ class PlayableAudioDevice:
         self.close()
 
     @property
+    def sampWidth(self):
+        return self.__sampWidth
+    
+    @sampWidth.setter
+    def sampWidth(self, val):
+        self.__sampWidth = int(val)
+        self.bitDepth = int(self.__sampWidth * 8)
+
+    @property
+    def bitDepth(self):
+        return self.__bitDepth
+    
+    @bitDepth.setter
+    def bitDepth(self, val):
+        self.__bitDepth = val
+        self.__format = self._formatDefaultInferences.get(val)
+
+    @property
+    def sampleRate(self):
+        return self.frameRate
+
+    @property
+    def frameRate(self):
+        return self.__frameRate
+    
+    @frameRate.setter
+    def frameRate(self, val):
+        self.__frameRate = int(val)
+
+    @property
     def format(self):
         return self.__format
 
     @format.setter
     def format(self, audioFormat):
-        if isinstance(audioFormat, int):
-            audioFormat = self._formatDefaultInferences.get(audioFormat)
         if audioFormat not in self._formatZeroValues.keys():
             raise ValueError('Invalid format')
         else:
             self.__format = audioFormat
+        if self.__format in self._formatBitDepths.keys():
+            self.__bitDepth = self._formatBitDepths[self.__format]
         self.__zero = self._formatZeroValues[self.__format]
 
     def set_format(
-                self, channels=2, audioFormat=pyaudio.paInt16,
-                frameRate=88200, **kwargs
+                self, channels=2, sampWidth=2,
+                frameRate=44100, **kwargs
             ):
         print('Setting format')
         print(
-                'Format args: ', channels, audioFormat,
+                'Format args: ', channels, sampWidth,
                 frameRate, **kwargs
               )
-        self.format = audioFormat
         self.channels = channels
+        self.sampWidth = sampWidth
         self.frameRate = frameRate
-        self.sampleRate = self.frameRate / self.channels
         print('Format set')
     
-    def set_buffers(self, bufferLength=None, ringSize=None, **kwargs):
+    def set_buffers(self, bufferLength=64, ringSize=8, **kwargs):
         print('Setting buffers')
-        if bufferLength is None:
-            if not self.bufferLength:
-                bufferLength = 64
-        if bufferLength:
-            self.bufferLength = bufferLength
         if bufferLength % self.channels:
             raise ValueError(
                 'Buffer length must be divisible by channels'
             )
-        if ringSize is None:
-            if not self.ringSize:
-                ringSize = 8
-        if ringSize:
-            self.ringSize = ringSize
+        self.bufferLength = bufferLength
+        self.ringSize = ringSize
         if self.__streamOpen:
             self.stream.stop_stream()
             self.stream.close()
@@ -427,7 +456,7 @@ class PlayableAudioDevice:
                     **kwargs
                 ))
         self.interleaved = ThreadedRingBuffer(
-                sampleRate=self.sampleRate,
+                sampleRate=self.frameRate,
                 bufferLength=self.bufferLength,
                 ringSize=self.ringSize,
                 zero=self.__zero
@@ -437,7 +466,7 @@ class PlayableAudioDevice:
         self.stream = self._player.open(
                 format=self.format,
                 channels=self.channels,
-                rate=self.sampleRate,
+                rate=self.frameRate,
                 output=True
             )
         self.__streamOpen = True

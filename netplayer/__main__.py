@@ -9,6 +9,10 @@ import inspect
 from pyringbuffer import *
 
 
+class InvalidCallback(Exception):
+    pass
+
+
 @dataclasses.dataclass
 class Client:
     def __init__(self, client):
@@ -23,8 +27,10 @@ class Client:
 
 
 class NetplayerBase:
-    def __init__(self, chunkSize=4096):
+    def __init__(self, port=25000, chunkSize=4096):
+        self.alive = None
         self.chunkSize = chunkSize
+        self.port = port
         self.__filename = None
         self.__filesize = None
         self.__framecount = 0
@@ -41,6 +47,18 @@ class NetplayerBase:
                 json.dumps({'paused': False}).encode('utf-8')
             )
     
+    def __del__(self):
+        self.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.close()
+        
+    def close(self):
+        self.alive = False
+
     @property
     def chunkSize(self):
         return self.__chunkSize
@@ -127,7 +145,7 @@ class AudioServer(NetplayerBase):
             self.framecount = wav.getnframes()
             self.asset = wav.readframes(self.framecount)
             self.filesize = len(self.asset)
-            self.parameters = wav.getparams()
+            self.parameters = wav.getparams()[0:3]
         for client in self.clients:
             client.index = 0
     
@@ -300,14 +318,10 @@ class AudioServer(NetplayerBase):
 
 
 class AudioReceiver(NetplayerBase):
-    def __init__(
-        self, host='127.0.0.1', port=25000,
-        chunkSize=4096, **kwargs
-    ):
+    def __init__(self, host='127.0.0.1', **kwargs):
         print('Starting audio receiver')
-        super().__init__(chunkSize=chunkSize, **kwargs)
+        super().__init__(**kwargs)
         self.host = host
-        self.port = port
         self.ready = False
         self.receiving = False
         # self.queue = collections.deque()
@@ -316,9 +330,6 @@ class AudioReceiver(NetplayerBase):
         self._requested = False
         self._receivedCommand = False
         self.alive = True
-
-    def set_format(self, *args, **kwargs):
-        pass
 
     def _encode_request(self):
         return json.dumps({
@@ -358,9 +369,8 @@ class AudioReceiver(NetplayerBase):
             self.framecount = int(header['framecount'])
             self.filesize = int(header['filesize'])
             self.remaining = self.filesize
-            print(f'Header format received: {header["format"]}')
-            nchannels, sampwidth, samprate = header['format'][0:3]
-            self.set_format(nchannels, sampwidth * 8, samprate)
+            self.__parameters = header['format']
+            print(f'Audio format received in header: {self.__parameters}')
         except:
             return
         else:
@@ -432,13 +442,16 @@ class AudioReceiver(NetplayerBase):
 
     async def run(self, callback=None):
         try:
-            callbackIsCoroutine = inspect.iscoroutine(callback(b''))
-        except RuntimeWarning:
-            pass
+            callbackIsCoroutine = inspect.iscoroutinefunction(callback)
         except:
             pass
-        if callback and not callable(callback):
-            raise ValueError('Callback must be callable')
+        if callback:
+            if not callable(callback):
+                raise InvalidCallback('Callback must be callable')
+            elif not inspect.signature(callback).parameters:
+                raise InvalidCallback(
+                        'Callback must accept at least one argument'
+                    )
         while self.alive:
             try:
                 sock = await curio.open_connection(self.host, self.port)
@@ -470,16 +483,14 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
         super().__init__(*args, **kwargs)
         AudioReceiver.__init__(self, *args, **kwargs)
         print('NetPlayerReciever initialized')
-
-    def set_format(self, *args, **kwargs):
-        print('Setting NetPlayerReceiver format')
-        super().set_format(*args, **kwargs)
     
     def _get_header(self, *args, **kwargs):
         super()._get_header(*args, **kwargs)
+        print('Setting NetPlayerReceiver format')
+        super().set_format(*self.__parameters)
         print('Setting NetPlayerReceiver buffers')
         super().set_buffers(**kwargs)
-        print('Got header; starting output buffer')
+        print('Starting output buffer')
         super().start()
 
     def run(self):
@@ -496,23 +507,32 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
         time.sleep(1)
 
 
+class NetPlayerServer(AudioServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def run(self):
+        curio.run(
+                curio.tcp_server, '',
+                self.port, super().serve_all_assets
+            )
+
+
 async def print_chunk_len(chunk):
     print(f'Received chunk of len {len(chunk)}')
     await curio.sleep(0)
 
 
 def serve():
-    server = AudioServer(['../audio_files/pinkNoise_01.wav'])
-    curio.run(curio.tcp_server, '', 25000, server.serve_all_assets)
+    with NetPlayerServer(['../audio_files/pinkNoise_01.wav']) as server:
+        server.run()
+    print('Stopped server')
 
 
 def receive():
-    # receiver = AudioReceiver()
-    # curio.run(receiver.run, print_chunk_len)
-    print('Starting audio receiver')
     with NetPlayerReceiver() as device:
-        # device.set_format()
         device.run()
+    print('Stopped receiver')
 
 
 if __name__ == '__main__':
