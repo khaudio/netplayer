@@ -20,11 +20,23 @@ __all__ = [
     ]
 
 def visualize_line(state, lineLength=80):
-    print(' '.join((' ' * int((lineLength - 1) * float_to_scalar(state)), u'\u2058', str(state))))
+    print(' '.join(
+            (' ' * int((lineLength - 1) * float_to_scalar(state)),
+            u'\u2058', str(state))
+        ))
 
 def visualize(samples, lineLength=80):
     for sample in samples:
         visualize_line(sample, lineLength)
+
+
+def clip_value(value, minimum, maximum):
+    if value < minimum:
+        return minimum
+    elif value > maximum:
+        return maximum
+    else:
+        return value
 
 
 def clip_float(value):
@@ -37,14 +49,13 @@ def clip_float(value):
 
 
 def clip_int(value, bitDepth=8, signed=False):
-    maximum = (2 ** (bitDepth - 1) - 1) if signed else ((2 ** bitDepth) - 1)
-    minimum = -(maximum + 1) if signed else 0
-    if value > maximum:
-        return maximum
-    elif value < minimum:
-        return minimum
+    if signed:
+        maximum = (2 ** (bitDepth - 1) - 1)
+        minimum = -(maximum + 1)
     else:
-        return value
+        maximum = ((2 ** bitDepth) - 1)
+        minimum = 0
+    return clip_value(value, minimum, maximum)
 
 
 def float_to_int(value, bitDepth=8, signed=False):
@@ -133,25 +144,44 @@ class RingBufferBase:
 
 
 class RingBuffer(RingBufferBase):
-    def __init__(self, bufferLength=64, ringSize=8, zero=0):
-        super().__init__(bufferLength=bufferLength, ringSize=ringSize)
+    def __init__(self, zero=0, **kwargs):
+        super().__init__(**kwargs)
+        self._zero = zero
+        self._zeroes = collections.deque(
+                self._zero for _ in range(self.bufferLength)
+            )
         self.ring = collections.deque(maxlen=self.ringSize)
         for _ in range(self.ringSize):
             self.ring.append(collections.deque(maxlen=self.bufferLength))
         self.samplesWritten = 0
         self.samplesRemaining = self.bufferLength
         self.totalRingSampleLength = self.bufferLength * self.ringSize
+        self._buffered = 0
         self._readIndex, self._writeIndex = 0, 1
-        self._zero = zero
-        self._zeroes = collections.deque(
-                self._zero for _ in range(self.bufferLength)
-            )
-        for buff in self.ring:
+        for buffer in self.ring:
             for _ in range(self.bufferLength):
-                buff.append(0)
+                buffer.append(0)
         self.callback = None
     
-    def _pad(self, filler=0, bufferIndex=None, sampleIndex=None):
+    @property
+    def _buffered(self):
+        return self.__buffered
+    
+    @_buffered.setter
+    def _buffered(self, val):
+        self.__buffered = clip_value(
+                val, 0, self.totalRingSampleLength
+            )
+
+    def buffered(self):
+        return self._buffered
+
+    def available(self):
+        return self.totalRingSampleLength - self._buffered
+    
+    def _pad(self, filler=None, bufferIndex=None, sampleIndex=None):
+        if filler is None:
+            filler = self._zero
         if bufferIndex is None:
             bufferIndex = self._writeIndex
         if sampleIndex is None:
@@ -159,14 +189,16 @@ class RingBuffer(RingBufferBase):
         for i in range(sampleIndex, self.bufferLength):
             self.ring[bufferIndex][i] = filler
     
-    def _fill_single(self, filler=0, bufferIndex=None):
+    def _fill_single(self, filler=None, bufferIndex=None):
         self._pad(filler, bufferIndex, 0)
     
-    def fill(self, filler=0, force=False):
+    def fill(self, filler=None, force=False):
+        if filler is None:
+            filler = self._zero
         if force:
-            for buff in self.ring:
+            for buffer in self.ring:
                 for i in range(self.bufferLength):
-                    buff[i] = filler
+                    buffer[i] = filler
         else:
             while self.writable():
                 self._fill_single(filler)
@@ -181,11 +213,14 @@ class RingBuffer(RingBufferBase):
     
     def rotate_read_buffer(self):
         self._readIndex += 1
+        print(f'Rotating read buffer to ring index {self._readIndex}')
         if self._readIndex >= self.ringSize:
             self._readIndex = 0
+        self._buffered -= self.bufferLength
     
     def rotate_write_buffer(self):
         self._writeIndex += 1
+        print(f'Rotating write buffer to ring index {self._writeIndex}')
         if self._writeIndex >= self.ringSize:
             self._writeIndex = 0
         self.samplesWritten = 0
@@ -207,6 +242,9 @@ class RingBuffer(RingBufferBase):
             self.ring[self._writeIndex][self.samplesWritten + i] = sample
         self.samplesWritten += len(data)
         self.samplesRemaining -= len(data)
+        self._buffered += len(data)
+        if not self.samplesRemaining:
+            self.rotate_write_buffer()
         return len(data)
     
     def write_single(self, data, force=False):
@@ -215,13 +253,14 @@ class RingBuffer(RingBufferBase):
         self.ring[self._writeIndex][self.samplesWritten] = data
         self.samplesWritten += 1
         self.samplesRemaining -= 1
+        self._buffered += 1
         if not self.samplesRemaining:
             self.rotate_write_buffer()
         return 1
 
     def write(self, data, force=False):
         '''Writes around ring and returns number of samples written'''
-        if len(data) <= self.bufferLength:
+        if len(data) <= self.samplesRemaining:
             return self._write(data)
         written = 0
         while data and (self.writable() or force):
@@ -230,8 +269,6 @@ class RingBuffer(RingBufferBase):
                 ) if len(data) > self.samplesRemaining else data)
             written += chunk
             data = collections.deque(trim_left(data, chunk))
-            if not self.samplesRemaining:
-                self.rotate_write_buffer()
         return written
     
     def write_direct(self, data, buffer):
@@ -252,8 +289,8 @@ class RingBuffer(RingBufferBase):
 
 
 class ThreadedRingBuffer(RingBuffer):
-    def __init__(self, bufferLength=64, ringSize=8, sampleRate=44100, zero=0.0):
-        super().__init__(bufferLength, ringSize)
+    def __init__(self, sampleRate=44100, **kwargs):
+        super().__init__(**kwargs)
         self.sampleRate = sampleRate
         self.__pauseLock = Lock()
         self.paused = None
@@ -263,10 +300,7 @@ class ThreadedRingBuffer(RingBuffer):
         self.__terminate = False
         self.bufferDuration = self.sampleRate / self.bufferLength
         self.rotater = None
-        # self._zero = zero
-        # self._zeroes = collections.deque(
-        #         self._zero for _ in range(self.bufferLength)
-        #     )
+        self.callback = kwargs.get('callback')
 
     @property
     def callback(self):
@@ -364,19 +398,13 @@ class PlayableAudioDevice:
     def __init__(self, **kwargs):
         self._player = pyaudio.PyAudio()
         self.__streamOpen = False
+        self.channels = None
+        self.__sampWidth = None
+        self.__frameRate = None
+        self.bufferLength = None
+        self.ringSize = None
         self.set_format()
-        self.set_buffers()
-        # self.stream = None
-        # self.channels = None
-        # self.channelBuffers = None
-        # self.interleaved = None
-        # self.__sampWidth = None
-        # self.__bitDepth = None
-        # self.__frameRate = None
-        # self.__format = None
-        # self.bufferLength = None
-        # self.ringSize = None
-        # self.__formatSet = False
+        self.set_buffers(openStream=False)
         if any(kwargs):
             self.set_format(**kwargs)
             self.set_buffers(**kwargs)
@@ -420,6 +448,7 @@ class PlayableAudioDevice:
     @frameRate.setter
     def frameRate(self, val):
         self.__frameRate = int(val)
+        self._frameDuration = 1 / self.frameRate
 
     @property
     def format(self):
@@ -441,48 +470,69 @@ class PlayableAudioDevice:
             ):
         print('Setting format')
         print(
-                'Format args: ', channels, sampWidth,
-                frameRate, **kwargs
+                'Format args: ',
+                channels, sampWidth,
+                frameRate, kwargs
               )
-        self.channels = channels
-        self.sampWidth = sampWidth
-        self.frameRate = frameRate
+        if (
+                not kwargs and
+                (channels, sampWidth, frameRate)
+                != (self.channels, self.sampWidth, self.frameRate)
+            ):
+            self.channels = channels
+            self.sampWidth = sampWidth
+            self.frameRate = frameRate
         print('Format set')
     
-    def set_buffers(self, bufferLength=64, ringSize=8, **kwargs):
-        print('Setting buffers')
-        if bufferLength % self.channels:
-            raise ValueError(
-                'Buffer length must be divisible by channels'
-            )
-        self.bufferLength = bufferLength
-        self.ringSize = ringSize
-        if self.__streamOpen:
-            self.stream.stop_stream()
-            self.stream.close()
-        self.channelBuffers = collections.deque()
-        for _ in range(self.channels):
-            self.channelBuffers.append(RingBuffer(
-                    bufferLength=int(self.bufferLength / self.channels),
+    def set_buffers(
+            self, bufferLength=4096, ringSize=8,
+            openStream=True, **kwargs
+        ):
+        if (
+                not kwargs
+                and (bufferLength, ringSize)
+                != (self.bufferLength, self.ringSize)
+            ):
+            print('Setting buffers')
+            if bufferLength % self.channels:
+                raise ValueError(
+                    'Buffer length must be divisible by channels'
+                )
+            self.bufferLength = bufferLength
+            self.ringSize = ringSize
+            if self.__streamOpen:
+                self.stream.stop_stream()
+                self.stream.close()
+            self.channelBuffers = collections.deque()
+            for _ in range(self.channels):
+                self.channelBuffers.append(RingBuffer(
+                        bufferLength=int(self.bufferLength / self.channels),
+                        ringSize=self.ringSize,
+                        zero=self._zero,
+                        **kwargs
+                    ))
+            self.interleaved = ThreadedRingBuffer(
+                    sampleRate=self.frameRate,
+                    bufferLength=self.bufferLength,
                     ringSize=self.ringSize,
                     zero=self._zero,
                     **kwargs
-                ))
-        self.interleaved = ThreadedRingBuffer(
-                sampleRate=self.frameRate,
-                bufferLength=self.bufferLength,
-                ringSize=self.ringSize,
-                zero=self._zero,
-                **kwargs
-            )
-        self.interleaved.callback = self._play
-        self.stream = self._player.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.frameRate,
-                output=True
-            )
-        self.__streamOpen = True
+                )
+            self.interleaved.callback = self._play
+        if openStream:
+            if self.__streamOpen:
+                self.stream.stop_stream()
+                self.stream.close()
+            self.stream = self._player.open(
+                    format=self.format,
+                    channels=self.channels,
+                    rate=self.frameRate,
+                    output=True
+                )
+            self.__streamOpen = True
+        else:
+            self.stream = None
+            self.__streamOpen = False
         self.__formatSet = True
         print('Buffers set')
 
@@ -498,6 +548,9 @@ class PlayableAudioDevice:
 
     def running(self):
         return self.interleaved.running()
+    
+    def playing(self):
+        return self.__streamOpen and not self.interleaved.paused
 
     def pause(self, seconds=None):
         self.interleaved.pause()
@@ -517,7 +570,15 @@ class PlayableAudioDevice:
         self._player.terminate()
         self.interleaved.stop_rotate_thread()
 
+    def _play(self, data):
+
+        # transformed = b''.join((np.float32(sample) for sample in data))
+        transformed = b''.join((np.int16(sample) for sample in data))
+        
+        self.stream.write(transformed)
+
     def _interleave_channel_buffers(self):
+        """
         if self.channels == 1:
             self.interleaved.write(self.channelBuffers[0].read())
         else:
@@ -525,12 +586,30 @@ class PlayableAudioDevice:
             for i in range(self.bufferLength):
                 for buffered in concatenated:
                     self.interleaved.write(buffered[i])
+        """
 
-    def _play(self, data):
-        transformed = b''.join((np.float32(sample) for sample in data))
-        self.stream.write(transformed)
+    def buffered(self):
+        return self.interleaved.buffered()
+    
+    def available(self):
+        return self.interleaved.available()
 
-    def _write(self, data):
+    def wait(self, required=None):
+        if not required:
+            required = self.bufferLength
+        while self.available() < required:
+            time.sleep(self._frameDuration)
+
+    def _write(self, data, **kwargs):
+        self.interleaved.write(data, **kwargs)
+        """
+        frames = len(data) / self.sampWidth
+        chunked = (
+                [[data[index + i] for i in range(width)]
+                for index in range(0, len(data), self.sampWidth)]
+            )
+        """
+        """
         if self.channels == 1:
             self.channelBuffers[0].write(data)
         else:
@@ -539,17 +618,21 @@ class PlayableAudioDevice:
                 for i, channelData in enumerate(channels):
                     self.channelBuffers[i].write_single(channelData)
         self._interleave_channel_buffers()
+        """
 
-    def write(self, data):
-        # data = tuple(data)
+    def write(self, data, **kwargs):
+        """
+        data = tuple(data)
         if len(data) % self.channels:
             raise IndexError('Invalid data length')
-        self._write(data)
+        """
+        
+        self._write(data, **kwargs)
 
 
 if __name__ == '__main__':
     sampleRate = 44100
-    bufferLength = 12000
+    bufferLength = 11025
     ringSize = 4
 
     with PlayableAudioDevice() as device:
@@ -558,23 +641,11 @@ if __name__ == '__main__':
                 format=pyaudio.paFloat32,
                 frameRate=sampleRate
             )
-        device.set_buffers(
-                bufferLength=bufferLength,
-                ringSize=ringSize
-            )
+        device.set_buffers(bufferLength=bufferLength, ringSize=ringSize)
 
         device.interleaved.write(tuple(
-                sine(1000, 48000, sampleRate, .25)
+                sine(1000, sampleRate, sampleRate, .25)
             ), force=True)
 
         device.start()
-        time.sleep(3)
-
-        device.pause(1)
-        
-        device.resume()
         time.sleep(2)
-        
-        device.pause(2)
-        
-        device.resume()
