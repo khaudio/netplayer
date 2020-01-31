@@ -116,6 +116,10 @@ def sine(frequency, length, sampleRate, scale=1.0, radians=0):
         radians += step
 
 
+class FormatUnknown(Exception):
+    pass
+
+
 class RingBufferBase:
     def __init__(self, bufferLength=64, ringSize=8):
         self.ringSize = ringSize
@@ -129,7 +133,7 @@ class RingBufferBase:
 
 
 class RingBuffer(RingBufferBase):
-    def __init__(self, bufferLength=64, ringSize=8):
+    def __init__(self, bufferLength=64, ringSize=8, zero=0):
         super().__init__(bufferLength=bufferLength, ringSize=ringSize)
         self.ring = collections.deque(maxlen=self.ringSize)
         for _ in range(self.ringSize):
@@ -138,6 +142,10 @@ class RingBuffer(RingBufferBase):
         self.samplesRemaining = self.bufferLength
         self.totalRingSampleLength = self.bufferLength * self.ringSize
         self._readIndex, self._writeIndex = 0, 1
+        self._zero = zero
+        self._zeroes = collections.deque(
+                self._zero for _ in range(self.bufferLength)
+            )
         for buff in self.ring:
             for _ in range(self.bufferLength):
                 buff.append(0)
@@ -242,6 +250,7 @@ class RingBuffer(RingBufferBase):
             else:
                 return data[written:]
 
+
 class ThreadedRingBuffer(RingBuffer):
     def __init__(self, bufferLength=64, ringSize=8, sampleRate=44100, zero=0.0):
         super().__init__(bufferLength, ringSize)
@@ -254,10 +263,10 @@ class ThreadedRingBuffer(RingBuffer):
         self.__terminate = False
         self.bufferDuration = self.sampleRate / self.bufferLength
         self.rotater = None
-        self._zero = zero
-        self.__zeroes = collections.deque(
-                self._zero for _ in range(self.bufferLength)
-            )
+        # self._zero = zero
+        # self._zeroes = collections.deque(
+        #         self._zero for _ in range(self.bufferLength)
+        #     )
 
     @property
     def callback(self):
@@ -296,7 +305,7 @@ class ThreadedRingBuffer(RingBuffer):
                     if not faded:
                         self.callback(self._fade_out())
                         faded = True
-                    self.callback(self.__zeroes)
+                    self.callback(self._zeroes)
                 else:
                     self.callback(super().read())
                     if faded:
@@ -322,10 +331,9 @@ class ThreadedRingBuffer(RingBuffer):
     def resume(self):
         with self.__pauseLock:
             self.paused = False
-
-
-class FormatUnknown(Exception):
-    pass
+    
+    def running(self):
+        return self.__threadRunning
 
 
 class PlayableAudioDevice:
@@ -355,16 +363,20 @@ class PlayableAudioDevice:
     
     def __init__(self, **kwargs):
         self._player = pyaudio.PyAudio()
-        self.stream = None
         self.__streamOpen = False
-        self.channels = None
-        self.__sampWidth = None
-        self.__bitDepth = None
-        self.__frameRate = None
-        self.__format = None
-        self.bufferLength = None
-        self.ringSize = None
-        self.__formatSet = False
+        self.set_format()
+        self.set_buffers()
+        # self.stream = None
+        # self.channels = None
+        # self.channelBuffers = None
+        # self.interleaved = None
+        # self.__sampWidth = None
+        # self.__bitDepth = None
+        # self.__frameRate = None
+        # self.__format = None
+        # self.bufferLength = None
+        # self.ringSize = None
+        # self.__formatSet = False
         if any(kwargs):
             self.set_format(**kwargs)
             self.set_buffers(**kwargs)
@@ -395,6 +407,7 @@ class PlayableAudioDevice:
     def bitDepth(self, val):
         self.__bitDepth = val
         self.__format = self._formatDefaultInferences.get(val)
+        self._zero = self._formatZeroValues[self.__format]
 
     @property
     def sampleRate(self):
@@ -420,7 +433,7 @@ class PlayableAudioDevice:
             self.__format = audioFormat
         if self.__format in self._formatBitDepths.keys():
             self.__bitDepth = self._formatBitDepths[self.__format]
-        self.__zero = self._formatZeroValues[self.__format]
+        self._zero = self._formatZeroValues[self.__format]
 
     def set_format(
                 self, channels=2, sampWidth=2,
@@ -452,14 +465,14 @@ class PlayableAudioDevice:
             self.channelBuffers.append(RingBuffer(
                     bufferLength=int(self.bufferLength / self.channels),
                     ringSize=self.ringSize,
-                    zero=self.__zero
+                    zero=self._zero,
                     **kwargs
                 ))
         self.interleaved = ThreadedRingBuffer(
                 sampleRate=self.frameRate,
                 bufferLength=self.bufferLength,
                 ringSize=self.ringSize,
-                zero=self.__zero
+                zero=self._zero,
                 **kwargs
             )
         self.interleaved.callback = self._play
@@ -475,6 +488,16 @@ class PlayableAudioDevice:
 
     def start(self):
         self.interleaved.start_rotate_thread()
+
+    def stop(self):
+        print('Stopping audio')
+        self.stream.stop_stream()
+        self.stream.close()
+        self.interleaved.stop_rotate_thread()
+        print('Stopped audio')
+
+    def running(self):
+        return self.interleaved.running()
 
     def pause(self, seconds=None):
         self.interleaved.pause()

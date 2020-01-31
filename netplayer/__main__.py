@@ -9,6 +9,10 @@ import inspect
 from pyringbuffer import *
 
 
+def print_progress(state, total, length=80, char='\u2022'):
+    print(f'\r{char * round(length * (state / total))}')
+
+
 class InvalidCallback(Exception):
     pass
 
@@ -223,7 +227,7 @@ class AudioServer(NetplayerBase):
                     break
                 del data
                 try:
-                    print(f'Server index: {self.index}')
+                    print(f'Server index: {self.index} of {self.filesize}')
                     chunk = bytearray(self.asset[
                             self.index:self.index + self.chunkSize
                         ])
@@ -329,6 +333,7 @@ class AudioReceiver(NetplayerBase):
         self._sent_ready = False
         self._requested = False
         self._receivedCommand = False
+        self._parameters = None
         self.alive = True
 
     def _encode_request(self):
@@ -365,12 +370,14 @@ class AudioReceiver(NetplayerBase):
     def _get_header(self, data):
         try:
             header = json.loads(data)
+            if not header:
+                return
             self.filename = header['filename']
             self.framecount = int(header['framecount'])
             self.filesize = int(header['filesize'])
             self.remaining = self.filesize
-            self.__parameters = header['format']
-            print(f'Audio format received in header: {self.__parameters}')
+            self._parameters = header['format']
+            print(f'Audio format received in header: {self._parameters}')
         except:
             return
         else:
@@ -403,8 +410,9 @@ class AudioReceiver(NetplayerBase):
             if not decoded:
                 print(
                     f'Got chunk of size: {len(chunk)},',
-                    f'Index: {self.index}'
+                    f'Index: {self.index} of {self.filesize}'
                 )
+                print_progress(self.index, self.filesize)
                 self.index += len(chunk)
                 self.remaining -= len(chunk)
                 self._receivedLastChunk = True
@@ -480,18 +488,24 @@ class AudioReceiver(NetplayerBase):
 
 class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
     def __init__(self, *args, **kwargs):
+        self.__started = False
         super().__init__(*args, **kwargs)
         AudioReceiver.__init__(self, *args, **kwargs)
         print('NetPlayerReciever initialized')
     
     def _get_header(self, *args, **kwargs):
-        super()._get_header(*args, **kwargs)
-        print('Setting NetPlayerReceiver format')
-        super().set_format(*self.__parameters)
-        print('Setting NetPlayerReceiver buffers')
-        super().set_buffers(**kwargs)
-        print('Starting output buffer')
-        super().start()
+        received = super()._get_header(*args, **kwargs)
+        if received:
+            if self.running():
+                super().stop()
+            if not self.running():
+                print('Setting NetPlayerReceiver format')
+                super().set_format(*self._parameters)
+                print('Setting NetPlayerReceiver buffers')
+                super().set_buffers(**kwargs)
+                print('Starting output buffer')
+                super().start()
+        return received
 
     def run(self):
         print('Starting')
@@ -501,10 +515,10 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
     def write(self, data):
         if data is None:
             return
-        super().write(data)
+        # super().write(data)
     
-        print(data)
-        time.sleep(1)
+        print(len(data))
+        time.sleep(.01)
 
 
 class NetPlayerServer(AudioServer):
