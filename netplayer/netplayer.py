@@ -150,7 +150,7 @@ class NetplayerBase:
             try:
                 value = int(value)
             except:
-                raise TypeErroFormatUnknownr('Must be int')
+                raise TypeError('Must be int')
         self.__index = value
 
 
@@ -539,31 +539,28 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
         curio.run(super().run, self.a_write)
         print('Done with async run')
 
-    async def a_wait(self, required=4096):
+    async def a_wait(self, required=None):
+        if not required:
+            required = self.interleaved.bufferLength
         while self.alive and self.interleaved.available() < required:
-            await curio.sleep(.01)
+            await curio.sleep(self.bufferDuration)
 
     async def a_write(self, data):
         if data is None:
             return
-        
         super().write(data)
         await self.a_wait(self.chunkSize)
-
-        # print_buffered_and_played(
-        #         self.index, self.filesize, self.buffered()
-        #     )
+        print_buffered_and_played(
+                self.index, self.filesize, self.buffered()
+            )
 
     def write(self, data):
         if data is None:
             return
-        
         super().write(data)
-        super().wait()
-
-        # print_buffered_and_played(
-        #         self.index, self.filesize, self.buffered()
-        #     )
+        print_buffered_and_played(
+                self.index, self.filesize, self.buffered()
+            )
 
 
 class NetPlayerServer(AudioServer):

@@ -9,6 +9,7 @@ import struct
 from multiprocessing import Lock
 import pyaudio
 import numpy as np
+from multiprocessing import Queue
 
 
 __all__ = [
@@ -19,15 +20,17 @@ __all__ = [
         'PlayableAudioDevice'
     ]
 
+
 def visualize_line(state, lineLength=80):
     print(' '.join(
             (' ' * int((lineLength - 1) * float_to_scalar(state)),
             u'\u2058', str(state))
         ))
 
-def visualize(samples, lineLength=80):
-    for sample in samples:
-        visualize_line(sample, lineLength)
+
+def visualize(value, lineLength=80):
+    for value in values:
+        visualize_line(value, lineLength)
 
 
 def clip_value(value, minimum, maximum):
@@ -100,11 +103,11 @@ def _log_fade(state, target, length):
     remainder = None
     conformed = (float_to_scalar(value) for value in (state, target))
     for i, multiplier in enumerate(_log_fade_scalar(*conformed, length - 1)):
-        sample = scalar_to_float(state * multiplier)
-        if sample < target:
+        value = scalar_to_float(state * multiplier)
+        if value < target:
             remainder = length - i
             break
-        yield sample
+        yield value
     if remainder:
         for _ in range(remainder):
             yield target
@@ -144,25 +147,25 @@ class RingBufferBase:
 
 
 class RingBuffer(RingBufferBase):
-    def __init__(self, zero=0, **kwargs):
+    def __init__(self, zero=b'\0', **kwargs):
         super().__init__(**kwargs)
         self._zero = zero
-        self._zeroes = collections.deque(
+        self._zeroes = bytes(
                 self._zero for _ in range(self.bufferLength)
             )
         self.ring = collections.deque(maxlen=self.ringSize)
         for _ in range(self.ringSize):
             self.ring.append(collections.deque(maxlen=self.bufferLength))
-        self.samplesWritten = 0
-        self.samplesRemaining = self.bufferLength
-        self.totalRingSampleLength = self.bufferLength * self.ringSize
+        self.bytesWritten = 0
+        self.bytesRemaining = self.bufferLength
+        self.totalRingByteLength = self.bufferLength * self.ringSize
         self._buffered = 0
         self._readIndex, self._writeIndex = 0, 1
         for buffer in self.ring:
             for _ in range(self.bufferLength):
                 buffer.append(0)
         self.callback = None
-    
+
     @property
     def _buffered(self):
         return self.__buffered
@@ -170,23 +173,23 @@ class RingBuffer(RingBufferBase):
     @_buffered.setter
     def _buffered(self, val):
         self.__buffered = clip_value(
-                val, 0, self.totalRingSampleLength
+                val, 0, self.totalRingByteLength
             )
-
+    
     def buffered(self):
         return self._buffered
-
-    def available(self):
-        return self.totalRingSampleLength - self._buffered
     
-    def _pad(self, filler=None, bufferIndex=None, sampleIndex=None):
+    def available(self):
+        return self.totalRingByteLength - self._buffered
+    
+    def _pad(self, filler=None, bufferIndex=None, byteIndex=None):
         if filler is None:
             filler = self._zero
         if bufferIndex is None:
             bufferIndex = self._writeIndex
-        if sampleIndex is None:
-            sampleIndex = self.samplesWritten
-        for i in range(sampleIndex, self.bufferLength):
+        if byteIndex is None:
+            byteIndex = self.bytesWritten
+        for i in range(byteIndex, self.bufferLength):
             self.ring[bufferIndex][i] = filler
     
     def _fill_single(self, filler=None, bufferIndex=None):
@@ -213,24 +216,28 @@ class RingBuffer(RingBufferBase):
     
     def rotate_read_buffer(self):
         self._readIndex += 1
-        print(f'Rotating read buffer to ring index {self._readIndex}')
+        # print(f'Rotating read buffer to ring index {self._readIndex}')
         if self._readIndex >= self.ringSize:
             self._readIndex = 0
         self._buffered -= self.bufferLength
+        if not self.writable():
+            self.rotate_write_buffer()
     
     def rotate_write_buffer(self):
+        # self.ring[self._writeIndex] = collections.deque([b''.join(np.int16(b) for b in self.ring[self._writeIndex])])
         self._writeIndex += 1
-        print(f'Rotating write buffer to ring index {self._writeIndex}')
+        # print(f'Rotating write buffer to ring index {self._writeIndex}')
         if self._writeIndex >= self.ringSize:
             self._writeIndex = 0
-        self.samplesWritten = 0
-        self.samplesRemaining = self.bufferLength
+        self.bytesWritten = 0
+        self.bytesRemaining = self.bufferLength
     
     def writable(self):
         return self._readIndex != self._writeIndex
     
     def _read(self):
-        return self.ring[self._readIndex]
+        # return self.ring[self._readIndex]
+        return bytes(self.ring[self._readIndex])
     
     def read(self):
         out = self._read()
@@ -238,54 +245,56 @@ class RingBuffer(RingBufferBase):
         return out
     
     def _write(self, data):
-        for i, sample in enumerate(data):
-            self.ring[self._writeIndex][self.samplesWritten + i] = sample
-        self.samplesWritten += len(data)
-        self.samplesRemaining -= len(data)
+        for i, byte in enumerate(data):
+            self.ring[self._writeIndex][self.bytesWritten + i] = byte
+        self.bytesWritten += len(data)
+        self.bytesRemaining -= len(data)
         self._buffered += len(data)
-        if not self.samplesRemaining:
+        if not self.bytesRemaining:
             self.rotate_write_buffer()
         return len(data)
     
     def write_single(self, data, force=False):
         if not self.writable() and not force:
             return 0
-        self.ring[self._writeIndex][self.samplesWritten] = data
-        self.samplesWritten += 1
-        self.samplesRemaining -= 1
+        self.ring[self._writeIndex][self.bytesWritten] = data
+        self.bytesWritten += 1
+        self.bytesRemaining -= 1
         self._buffered += 1
-        if not self.samplesRemaining:
+        if not self.bytesRemaining:
             self.rotate_write_buffer()
         return 1
 
     def write(self, data, force=False):
-        '''Writes around ring and returns number of samples written'''
-        if len(data) <= self.samplesRemaining:
+        '''Writes around ring and returns number of bytes written'''
+        if len(data) <= self.bytesRemaining:
             return self._write(data)
         written = 0
         while data and (self.writable() or force):
-            chunk = self._write(collections.deque(
-                    data[i] for i in range(self.samplesRemaining)
-                ) if len(data) > self.samplesRemaining else data)
+            # chunk = self._write(collections.deque(
+            #         data[i] for i in range(self.bytesRemaining)
+            #     ) if len(data) > self.bytesRemaining else data)
+            chunk = self._write(
+                    data[written:written + self.bytesRemaining]
+                    if len(data) > self.bytesRemaining else data
+                )
             written += chunk
-            data = collections.deque(trim_left(data, chunk))
+            data = data[chunk:]
+            # data = collections.deque(trim_left(data, chunk))
         return written
     
     def write_direct(self, data, buffer):
         if len(data) > self.bufferLength:
             raise IndexError(f'Max length: {self.bufferLength}')
-        for i, sample in enumerate(data):
-            buffer[i] = sample
+        for i, byte in enumerate(data):
+            buffer[i] = byte
         return len(data)
     
     def write_pop(self, data):
         '''Writes to ring and returns any unwritten data'''
         written = self.write(data)
         if len(data) > written:
-            if isinstance(data, collections.deque):
-                return collections.deque(trim_left(data, written))
-            else:
-                return data[written:]
+            return data[written:]
 
 
 class ThreadedRingBuffer(RingBuffer):
@@ -298,8 +307,8 @@ class ThreadedRingBuffer(RingBuffer):
         self.__threadRunning = False
         self.__terminationLock = Lock()
         self.__terminate = False
-        self.bufferDuration = self.sampleRate / self.bufferLength
         self.rotater = None
+        self._callbackQueue = Queue()
         self.callback = kwargs.get('callback')
 
     @property
@@ -311,15 +320,29 @@ class ThreadedRingBuffer(RingBuffer):
         self.__callback = func
 
     def _fade_out(self):
-        return collections.deque(linear_fade(
+        return bytes(linear_fade(
                 self.ring[self._readIndex][-1],
                 self._zero,
                 self.bufferLength
             ))
 
-    def _read_timer(self):
+    def _execute_callback(self, frameDuration):
+        print('Starting executor')
+        while self.__threadRunning:
+            if not self._callbackQueue.empty:
+                print('Callback queue has an item')
+                chunk = self._callbackQueue.get()
+                print(f'Callback queue yielded a chunk of type {type(chunk)} and len {len(chunk)}')
+                self.callback(chunk)
+                print(f'Callback executed')
+            else:
+                print('Callback queue is empty')
+            time.sleep(frameDuration)
+        print('Exiting executor')
+    
+    def _read_timer(self, bufferDuration):
         try:
-            now = time.time_ns()
+            now = time.time_ns() / 1e9
         except:
             now = time.time()
         last = now
@@ -327,11 +350,11 @@ class ThreadedRingBuffer(RingBuffer):
         faded = False
         while self.__threadRunning:
             try:
-                now = time.time_ns()
+                now = time.time_ns() / 1e9
             except:
                 now = time.time()
             elapsed += now - last
-            if elapsed >= self.bufferDuration:
+            if elapsed >= bufferDuration:
                 if self.__terminate:
                     self.callback(self._fade_out())
                     self.__threadRunning = False
@@ -341,16 +364,23 @@ class ThreadedRingBuffer(RingBuffer):
                         faded = True
                     self.callback(self._zeroes)
                 else:
-                    self.callback(super().read())
+                    self.callback(super()._read())
+                    super().rotate_read_buffer()
                     if faded:
                         faded = False
                 last = now
+                try:
+                    elapsed = (time.time_ns() / 1e9) - now
+                except:
+                    elapsed = time.time() - now
 
-    def start_rotate_thread(self):
-        self.rotater = threading.Thread(target=self._read_timer)
+    def start_rotate_thread(self, bufferDuration):
         self.__threadRunning = True
         self.__terminate = False
         self.paused = False
+        self.rotater = threading.Thread(
+                target=self._read_timer, args=(bufferDuration,)
+            )
         self.rotater.start()
 
     def stop_rotate_thread(self):
@@ -394,7 +424,7 @@ class PlayableAudioDevice:
             pyaudio.paUInt8: 127,
             pyaudio.paCustomFormat: 0
         }
-    
+
     def __init__(self, **kwargs):
         self._player = pyaudio.PyAudio()
         self.__streamOpen = False
@@ -449,6 +479,10 @@ class PlayableAudioDevice:
     def frameRate(self, val):
         self.__frameRate = int(val)
         self._frameDuration = 1 / self.frameRate
+        self.__byteDuration = (
+                self._frameDuration
+                / (self.channels * self.sampWidth)
+            )
 
     @property
     def format(self):
@@ -469,11 +503,6 @@ class PlayableAudioDevice:
                 frameRate=44100, **kwargs
             ):
         print('Setting format')
-        print(
-                'Format args: ',
-                channels, sampWidth,
-                frameRate, kwargs
-              )
         if (
                 not kwargs and
                 (channels, sampWidth, frameRate)
@@ -483,7 +512,7 @@ class PlayableAudioDevice:
             self.sampWidth = sampWidth
             self.frameRate = frameRate
         print('Format set')
-    
+
     def set_buffers(
             self, bufferLength=4096, ringSize=8,
             openStream=True, **kwargs
@@ -500,6 +529,9 @@ class PlayableAudioDevice:
                 )
             self.bufferLength = bufferLength
             self.ringSize = ringSize
+            self.bufferDuration = (
+                    self.__byteDuration * self.bufferLength
+                )
             if self.__streamOpen:
                 self.stream.stop_stream()
                 self.stream.close()
@@ -537,7 +569,7 @@ class PlayableAudioDevice:
         print('Buffers set')
 
     def start(self):
-        self.interleaved.start_rotate_thread()
+        self.interleaved.start_rotate_thread(self.bufferDuration)
 
     def stop(self):
         print('Stopping audio')
@@ -548,7 +580,7 @@ class PlayableAudioDevice:
 
     def running(self):
         return self.interleaved.running()
-    
+
     def playing(self):
         return self.__streamOpen and not self.interleaved.paused
 
@@ -571,11 +603,7 @@ class PlayableAudioDevice:
         self.interleaved.stop_rotate_thread()
 
     def _play(self, data):
-
-        # transformed = b''.join((np.float32(sample) for sample in data))
-        transformed = b''.join((np.int16(sample) for sample in data))
-        
-        self.stream.write(transformed)
+        self.stream.write(data)
 
     def _interleave_channel_buffers(self):
         """
@@ -590,7 +618,7 @@ class PlayableAudioDevice:
 
     def buffered(self):
         return self.interleaved.buffered()
-    
+
     def available(self):
         return self.interleaved.available()
 
@@ -598,7 +626,7 @@ class PlayableAudioDevice:
         if not required:
             required = self.bufferLength
         while self.available() < required:
-            time.sleep(self._frameDuration)
+            time.sleep(self.bufferDuration)
 
     def _write(self, data, **kwargs):
         self.interleaved.write(data, **kwargs)
@@ -621,20 +649,22 @@ class PlayableAudioDevice:
         """
 
     def write(self, data, **kwargs):
+        while data:
+            data = self.interleaved.write_pop(data, **kwargs)
+            self.wait()
+        
         """
         data = tuple(data)
         if len(data) % self.channels:
             raise IndexError('Invalid data length')
         """
-        
-        self._write(data, **kwargs)
+        # self._write(data, **kwargs)
 
 
 if __name__ == '__main__':
     sampleRate = 44100
     bufferLength = 11025
     ringSize = 4
-
     with PlayableAudioDevice() as device:
         device.set_format(
                 channels=1,
@@ -642,10 +672,8 @@ if __name__ == '__main__':
                 frameRate=sampleRate
             )
         device.set_buffers(bufferLength=bufferLength, ringSize=ringSize)
-
         device.interleaved.write(tuple(
                 sine(1000, sampleRate, sampleRate, .25)
             ), force=True)
-
         device.start()
         time.sleep(2)
