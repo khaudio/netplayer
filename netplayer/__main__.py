@@ -11,7 +11,7 @@ def __serve():
 
 
 def __receive():
-    with NetPlayerReceiver(bufferLength=16384, ringSize=24, chunkSize=8192) as device:
+    with NetPlayerReceiver(bufferLength=352800, ringSize=8, chunkSize=8192) as device:
         device.run()
     print('Stopped receiver')
 
