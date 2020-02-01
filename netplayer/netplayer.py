@@ -23,12 +23,12 @@ __all__ = [
 
 
 def print_progress(state, total, length=80, char='\u2588'):
-    print(f'\r{char * round(length * (state / total))}')
+    print(f'{char * round(length * (state / total))}', end='\r')
 
 
 def print_buffered_and_played(state, total, buffered, length=80):
     stateRatio = state / total
-    bufferedRatio =  buffered / total
+    bufferedRatio =  (state + buffered) / total
     played = '\u2588' * round((stateRatio) * length)
     unplayed = '\u2592' * round(bufferedRatio * length)
     remainingLength = round(
@@ -38,7 +38,7 @@ def print_buffered_and_played(state, total, buffered, length=80):
             (len(played) + len(unplayed) + remainingLength)
             - length
         ))
-    print(f'\r{played}{unplayed}{remaining}\r')
+    print(f'{played}{unplayed}{remaining}', end='\r')
 
 
 class InvalidCallback(Exception):
