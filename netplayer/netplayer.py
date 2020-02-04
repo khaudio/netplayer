@@ -28,17 +28,19 @@ def print_progress(state, total, length=80, char='\u2588'):
 
 def print_buffered_and_played(state, total, buffered, length=80):
     stateRatio = state / total
-    bufferedRatio =  (state + buffered) / total
+    bufferedRatio =  buffered / total
     played = '\u2588' * round((stateRatio) * length)
     unplayed = '\u2592' * round(bufferedRatio * length)
-    remainingLength = round(
+    unbufferedLength = round(
             (1.0 - (stateRatio + bufferedRatio)) * length
         )
-    remaining = '\u2591' * (remainingLength - (
-            (len(played) + len(unplayed) + remainingLength)
+    unbuffered = '\u2591' * (unbufferedLength - (
+            (len(played) + len(unplayed) + unbufferedLength)
             - length
         ))
-    print(f'{played}{unplayed}{remaining}', end='\r')
+    print(
+            ''.join((played, unplayed, unbuffered))[:length], end='\r'
+        )
 
 
 class InvalidCallback(Exception):
@@ -67,7 +69,6 @@ class NetplayerBase:
         self.__filesize = None
         self.__framecount = 0
         self.index = 0
-        self.paused = False
         self._ready_signal = json.dumps({
                 'ready': True
             }).encode('utf-8')
@@ -203,11 +204,11 @@ class AudioServer(NetplayerBase):
 
     async def pause(self):
         for client in self.clients:
-            await self._pause_client(client)
+            await self._pause_client(client.client)
 
     async def resume(self):
         for client in self.clients:
-            await self._resume_client(client)
+            await self._resume_client(client.client)
 
     def _encode_header(self):
         return json.dumps({
@@ -226,6 +227,7 @@ class AudioServer(NetplayerBase):
 
     async def _send_end_of_asset(self, client):
         print('Sending end of asset')
+        await self._pause_client(client.client)
         await client.client.sendall(self.eof)
         client.ready = False
         client.acknowledged = False
@@ -237,6 +239,7 @@ class AudioServer(NetplayerBase):
 
     async def send_asset(self, client):
         print(f'Sending asset')
+        self._resume_client(client.client)
         while self.alive:
             data  = await client.client.recv(1000)
             if data:
@@ -301,14 +304,14 @@ class AudioServer(NetplayerBase):
     async def serve_asset(self, client, addr):
         client.ready = False
         client.acknowledged = False
-        decoded = None
         while self.alive:
             if not client.ready:
                 client.ready = await self.send_header(
                         client.client, addr
                     )
             elif client.ready and not client.acknowledged:
-                await client.client.sendall(self._ready_signal)
+                # await client.client.sendall(self._ready_signal)
+                await client.client.sendall(json.dumps({'ready': True, 'pause': False}).encode('utf-8'))
                 client.acknowledged = True
             elif all(c.acknowledged for c in self.clients):
                 print('All clients ready and acknowledged')
@@ -340,7 +343,7 @@ class AudioServer(NetplayerBase):
                     self.filename = self.files[0]
                     self.load_asset(self.filename)
                 await curio.sleep(0)
-        except BrokenPipeError or ConnectionResetError:
+        except:
             print(f'{addr} disconnected')
         finally:
             if newClient in self.clients:
@@ -377,6 +380,12 @@ class AudioReceiver(NetplayerBase):
     #     else:
     #         self.queue.append(filename)
 
+    def pause(self, *args, **kwargs):
+        super().pause(*args, **kwargs)
+
+    def resume(self, *args, **kwargs):
+        super().pause(*args, **kwargs)
+
     async def send_ready(self, sock):
         print('Sending ready signal')
         self.index = 0
@@ -385,11 +394,21 @@ class AudioReceiver(NetplayerBase):
             await sock.sendall(self._ready_signal)
             self._sent_ready = True
         ack = await sock.recv(1000)
-        if ack == self._ready_signal:
-            self.ready = True
+        decoded = self._decode_commands(ack)
+        if decoded:
+            paused = decoded.get('pause')
+            if paused is not None:
+                if not paused:
+                    print('FOUND RESUME')
+                    self.resume()
+                else:
+                    print('PAUSING')
+                    super().pause()
+            if decoded.get('ready'):
+                print('FOUND READY')
+                self.ready = True
 
     async def request_chunk(self, sock):
-        # print('Requesting chunk')
         self._receivedLastChunk = False
         if not self._requested:
             await sock.sendall(self._encode_request())
@@ -432,25 +451,29 @@ class AudioReceiver(NetplayerBase):
     async def _receive_chunks(self, sock):
         if self._receivedLastChunk:
             await self.request_chunk(sock)
+        # print('Waiting for chunk')
         chunk = await sock.recv(self.chunkSize)
         if chunk:
+            # print(f'Got chunk of len {len(chunk)}')
             decoded = self._decode_commands(chunk)
             if not decoded:
-                # print(
-                #     f'Got chunk of size: {len(chunk)},',
-                #     f'Index: {self.index} of {self.filesize}'
-                # )
+                # print('Chunk not decoded')
                 self.index += len(chunk)
                 self.remaining -= len(chunk)
                 self._receivedLastChunk = True
                 yield chunk
             else:
+                print(f'Decoded chunk: {decoded}')
                 if decoded.get('end'):
-                    print(f'Got EOF')
+                    print('Got EOF')
+                    self.pause()
                     self._unready()
-                if decoded.get('pause'):
-                    print(f'Pausing playback')
-                    self.paused = paused
+                if decoded.get('resume'):
+                    print('Resuming playback')
+                    self.resume()
+                elif decoded.get('pause'):
+                    print('Pausing playback')
+                    self.pause()
                 if self._get_header(chunk):
                     self._unready()
             self._requested = False
@@ -461,11 +484,15 @@ class AudioReceiver(NetplayerBase):
         self.ready = False
         self._sent_ready = False
         self.receiving = False
+        self._requested = False
+        self._receivedLastChunk = False
 
     async def retrieve(self, sock):
         while self.alive:
             if not self.ready:
+                print('Waiting for ready')
                 if await self._wait_for_ready(sock):
+                    print('Starting to receive')
                     self.receiving = True
             elif self.receiving:
                 async with (
@@ -500,9 +527,8 @@ class AudioReceiver(NetplayerBase):
                             elif callback:
                                 callback(chunk)
                             await curio.sleep(0)
-            except ConnectionResetError or BrokenPipeError:
-                print('Disconnected; reconnecting...')
             except:
+                print('Disconnected; reconnecting...')
                 print('Stopping run')
                 raise
             else:
@@ -523,8 +549,6 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
     def _get_header(self, *args, **kwargs):
         received = super()._get_header(*args, **kwargs)
         if received:
-            if self.running():
-                super().stop()
             if not self.running():
                 print('Setting NetPlayerReceiver format')
                 super().set_format(*self._parameters)
@@ -532,12 +556,17 @@ class NetPlayerReceiver(PlayableAudioDevice, AudioReceiver):
                 super().set_buffers(**kwargs)
                 print('Starting output buffer')
                 super().start()
+            # else:
+            #     super().stop()
         return received
 
     def run(self):
         print('Starting')
         curio.run(super().run, self.a_write)
         print('Done with async run')
+
+    def _unready(self):
+        super()._unready()
 
     async def a_wait(self, required=None):
         if not required:

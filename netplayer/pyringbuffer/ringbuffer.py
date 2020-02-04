@@ -28,7 +28,7 @@ def visualize_line(state, lineLength=80):
         ))
 
 
-def visualize(value, lineLength=80):
+def visualize(values, lineLength=80):
     for value in values:
         visualize_line(value, lineLength)
 
@@ -245,7 +245,9 @@ class RingBuffer(RingBufferBase):
         return out
     
     def _write(self, data):
+        # print(f'len(data): {len(data)}')
         for i, byte in enumerate(data):
+            # print(f'byteIndex: {self.bytesWritten + i}')
             self.ring[self._writeIndex][self.bytesWritten + i] = byte
         self.bytesWritten += len(data)
         self.bytesRemaining -= len(data)
@@ -427,6 +429,7 @@ class PlayableAudioDevice:
 
     def __init__(self, **kwargs):
         self._player = pyaudio.PyAudio()
+        self.stream = None
         self.__streamOpen = False
         self.channels = None
         self.__sampWidth = None
@@ -535,14 +538,6 @@ class PlayableAudioDevice:
             if self.__streamOpen:
                 self.stream.stop_stream()
                 self.stream.close()
-            self.channelBuffers = collections.deque()
-            for _ in range(self.channels):
-                self.channelBuffers.append(RingBuffer(
-                        bufferLength=int(self.bufferLength / self.channels),
-                        ringSize=self.ringSize,
-                        zero=self._zero,
-                        **kwargs
-                    ))
             self.interleaved = ThreadedRingBuffer(
                     sampleRate=self.frameRate,
                     bufferLength=self.bufferLength,
@@ -605,17 +600,6 @@ class PlayableAudioDevice:
     def _play(self, data):
         self.stream.write(data)
 
-    def _interleave_channel_buffers(self):
-        """
-        if self.channels == 1:
-            self.interleaved.write(self.channelBuffers[0].read())
-        else:
-            concatenated = (b.read() for b in self.channelBuffers)
-            for i in range(self.bufferLength):
-                for buffered in concatenated:
-                    self.interleaved.write(buffered[i])
-        """
-
     def buffered(self):
         return self.interleaved.buffered()
 
@@ -628,37 +612,10 @@ class PlayableAudioDevice:
         while self.available() < required:
             time.sleep(self.bufferDuration)
 
-    def _write(self, data, **kwargs):
-        self.interleaved.write(data, **kwargs)
-        """
-        frames = len(data) / self.sampWidth
-        chunked = (
-                [[data[index + i] for i in range(width)]
-                for index in range(0, len(data), self.sampWidth)]
-            )
-        """
-        """
-        if self.channels == 1:
-            self.channelBuffers[0].write(data)
-        else:
-            for chunk in data[0:-1:self.channels]:
-                (channels,) = chunk
-                for i, channelData in enumerate(channels):
-                    self.channelBuffers[i].write_single(channelData)
-        self._interleave_channel_buffers()
-        """
-
     def write(self, data, **kwargs):
         while data:
             data = self.interleaved.write_pop(data, **kwargs)
             self.wait()
-        
-        """
-        data = tuple(data)
-        if len(data) % self.channels:
-            raise IndexError('Invalid data length')
-        """
-        # self._write(data, **kwargs)
 
 
 if __name__ == '__main__':
@@ -672,7 +629,7 @@ if __name__ == '__main__':
                 frameRate=sampleRate
             )
         device.set_buffers(bufferLength=bufferLength, ringSize=ringSize)
-        device.interleaved.write(tuple(
+        device.write(tuple(
                 sine(1000, sampleRate, sampleRate, .25)
             ), force=True)
         device.start()

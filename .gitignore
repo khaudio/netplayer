@@ -1,4 +1,6 @@
-01_One More Time.wav
+audio_files/
 .DS_Store
 android/
 __pycache__
+.vs
+.vscode
